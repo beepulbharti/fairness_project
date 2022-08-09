@@ -3,6 +3,17 @@
 # Import necessary packages
 import numpy as np
 from balancers import BinaryBalancer
+from tqdm import tqdm
+import os
+
+# pytorch
+import torch
+from torch.optim import Adam
+from torch import nn
+
+# BERT from Huggingface
+from transformers import BertTokenizer
+from transformers import BertModel
 
 
 # Sigmoid function
@@ -102,6 +113,7 @@ def calc_gen_bounds(alpha,beta,U,r,s):
         lb = alpha - beta + U*(alpha/r + beta/s) - U*(r+s)/(r*s)
     return ub, lb
 
+# Function to post process y_hat
 def eo_postprocess(df):
     a = df.a.values
     y = np.array(df.y.values)
@@ -110,3 +122,118 @@ def eo_postprocess(df):
     fair_model.adjust(goal='odds', summary=False)
     fair_yh = fair_model.predict(y_,a)
     return fair_yh, fair_model
+
+# Dataset class for BERT
+class Dataset(torch.utils.data.Dataset):
+
+    def __init__(self, df):
+
+        self.labels = [label for label in df['a']]
+        tokenizer = BertTokenizer.from_pretrained('bert-base-cased')
+        self.texts = [tokenizer(text, 
+                               padding='max_length', max_length = 5, truncation=True,
+                                return_tensors="pt") for text in df['long_name']]
+        self.remain_data = [df[['age','overall','y','group']].iloc[idx] for idx in range(df.shape[0])]
+
+    def classes(self):
+        return self.labels
+
+    def __len__(self):
+        return len(self.labels)
+
+    def __getitem__(self, idx):
+        
+        batch_texts = self.texts[idx]
+        batch_y = torch.tensor(self.labels[idx])
+        batch_rest = torch.tensor(self.remain_data[idx])
+
+        return batch_texts, batch_y, batch_rest
+
+# Class for classifier
+class BertClassifier(nn.Module):
+
+    def __init__(self, dropout=0.5):
+
+        super(BertClassifier, self).__init__()
+
+        self.bert = BertModel.from_pretrained('bert-base-cased')
+        self.dropout = nn.Dropout(dropout)
+        self.linear = nn.Linear(768, 1)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, input_id, mask):
+
+        _, pooled_output = self.bert(input_ids= input_id, attention_mask=mask,return_dict=False)
+        dropout_output = self.dropout(pooled_output)
+        linear_output = self.linear(dropout_output)
+        final_layer = self.sigmoid(linear_output)
+
+        return final_layer
+
+
+def train(model, train_data, val_data, learning_rate, epochs):
+    
+    batch_sz = 2
+
+    train, val = Dataset(train_data), Dataset(val_data)
+
+    train_dataloader = torch.utils.data.DataLoader(train, batch_size=batch_sz, shuffle=True)
+    val_dataloader = torch.utils.data.DataLoader(val, batch_size=batch_sz)
+
+    os.environ['CUDE_VISIBLE_DEVICES'] = '0'
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "mps")
+    model.to(device)
+
+    criterion = nn.BCELoss()
+    optimizer = Adam(model.parameters(), lr= learning_rate)
+
+
+    for epoch_num in range(epochs):
+
+        model.train()
+        total_loss_train = 0
+        total_tp_train = 0
+
+        for train_input, train_label, _ in tqdm(train_dataloader):
+
+            train_label = train_label.to(device).float()
+            mask = train_input['attention_mask'].to(device)
+            input_id = train_input['input_ids'].squeeze(1).to(device)
+
+            output = model(input_id, mask).reshape(1,-1)[0] 
+            batch_loss = criterion(output, train_label)
+            batch_tp = torch.sum((output >= 0.5) == train_label)
+            
+            total_tp_train += batch_tp.item()
+            total_loss_train += batch_loss.item()
+
+            model.zero_grad()
+            batch_loss.backward()
+            optimizer.step()
+                
+        total_loss_val = 0
+        total_tp_val = 0
+
+        with torch.no_grad():
+
+            model.eval()
+
+            for val_input, val_label, _ in val_dataloader:
+
+                val_label = val_label.to(device).float()
+                mask = val_input['attention_mask'].to(device)
+                input_id = val_input['input_ids'].squeeze(1).to(device)
+
+                output = model(input_id, mask).reshape(1,-1)[0]
+                batch_loss = criterion(output, val_label)
+                batch_tp = torch.sum((output >= 0.5) == val_label)
+                    
+                total_tp_val += batch_tp.item()    
+                total_loss_val += batch_loss.item()
+                    
+            
+        print(
+            f'Epochs: {epoch_num + 1} | Train Loss: {total_loss_train / (len(train_data)/batch_sz): .3f} \
+            | Train Accuracy: {total_tp_train / len(train_data): .3f} \
+            | Val Loss: {total_loss_val / (len(val_data)/batch_sz): .3f} \
+            | Val Accuracy: {total_tp_val / len(val_data): .3f}')
