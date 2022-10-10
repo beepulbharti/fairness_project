@@ -2,9 +2,10 @@
 
 # Import necessary packages
 import numpy as np
-from balancers import BinaryBalancer
+from updated_balancers import BinaryBalancer
 from tqdm import tqdm
 import os
+import pandas as pd
 
 # pytorch
 import torch
@@ -21,20 +22,16 @@ def sigmoid(x):
     sig = 1 / (1 + np.exp(-x))
     return sig
 
-# Function to generate data
+# New function to generate data (X,y)
 def generate_data(n,e1,e2,b,group,exp):
 
     # Mean and variance for features x1,x2,x3
-    # x3 is independent from x1 and x2
     mu = np.array([1,-1,0])
     var = np.array([[1,0.2,0],[0.2,1,0],[0,0,1]])
     X = np.random.multivariate_normal(mu,var,n)
-    x1 = X[:,0]
-    x2 = X[:,1]
-    x3 = X[:,2]
 
     # Function from x3 to A
-    a = ((x3 + b) >= 0).astype('float')
+    a = ((X[:,2] + b) >= 0).astype('float')
 
     # Function from x1 and x2 to A
     eps_1 = np.random.normal(0,e1,n)
@@ -42,32 +39,46 @@ def generate_data(n,e1,e2,b,group,exp):
 
     # add noise to a = 0 or a = 1
     noise_a = eps_2*(a==group)
-    
-    if exp == 1:
-        y = (sigmoid(x1 + x2 + eps_1 + noise_a) >= 0.5).astype('float')
-    else:
-        y = (sigmoid(x1 + x2 + x3 + eps_1 + noise_a) >= 0.5).astype('float')
 
-    # y_hat
+    # Generate y depending on experiment
     if exp == 1:
-        y_prob = sigmoid(x1 + x2)
+        y = (sigmoid(X[:,0] + X[:,1] + eps_1 + noise_a) >= 0.5).astype('float')
     else:
-        y_prob = sigmoid(x1 + x2 + x3)
+        y = (sigmoid(X[:,0] + X[:,1] + X[:,2] + eps_1 + noise_a) >= 0.5).astype('float')
     
+    return (X, a, y)
+
+# Function to generate y_prob using random coefficients
+def generate_y_hat(X,coeffs,exp):
+    if exp == 1:
+        y_prob = sigmoid(np.dot(X[:,:2],coeffs[:2]))
+    else:
+        y_prob = sigmoid(np.dot(X,coeffs))
     y_hat = (y_prob >= 0.5).astype('float')
 
-    return X, a, y_prob, y_hat, y
+    return (y_prob, y_hat)
+
+def calc_base_rates(y,a):
+    # Organizing data
+    data = np.column_stack((y,a))
+
+    # converting to dataframes
+    df = pd.DataFrame(data, columns = ['y','a'])
+
+    # calculating base rates
+    r = df[(df['a'] == 1) & (df['y'] == 1)].shape[0]/df.shape[0]
+    s = df[(df['a'] == 0) & (df['y'] == 1)].shape[0]/df.shape[0]
+    v = df[(df['a'] == 1) & (df['y'] == 0)].shape[0]/df.shape[0]
+    w = df[(df['a'] == 0) & (df['y'] == 0)].shape[0]/df.shape[0]
+    
+    return (r,s,v,w)
 
 # Functions to calculate the TPRs and FPRs with respect to A
-def calculate_bias_metrics(df):
-    a = df.a.values
-    y = np.array(df.y.values)
-    y_ = np.array(df.y_hat.values)
-    pb = BinaryBalancer(y=y,y_=y_,a=a,summary=False)
-    alpha = pb.group_rates[1.0].tpr
-    beta = pb.group_rates[0.0].tpr
-    tau = pb.group_rates[1.0].fpr
-    phi = pb.group_rates[0.0].fpr
+def calculate_bias_metrics(balancer):
+    alpha = balancer.group_rates[1.0].tpr
+    beta = balancer.group_rates[0.0].tpr
+    tau = balancer.group_rates[1.0].fpr
+    phi = balancer.group_rates[0.0].fpr
     return alpha,beta,tau,phi
 
 # Generate a_hat by making independent errors with probability = p
@@ -83,8 +94,7 @@ def generate_a_hat_indep_p(a,p):
     return a_hat
 
 # Generate a_hat for experiment 2
-def generate_a_hat(x3, b, mu ,noise):
-    e = np.random.normal(mu,noise)
+def generate_a_hat(x3, b, e):
     a_hat = ((x3 + e + b) >= 0).astype('float')
     return a_hat
 
@@ -114,11 +124,72 @@ def calc_gen_bounds(alpha,beta,U,r,s):
     return ub, lb
 
 # Function to post process y_hat
-def eo_postprocess(df):
+def eo_postprocess(y,y_,a):
+    fair_model = BinaryBalancer(y=y,y_=y_,a=a)
+    fair_model.adjust(goal='odds', summary=False)
+    fair_yh = fair_model.predict(y_,a)
+    return fair_yh, fair_model
+
+# Function to generate data
+def old_generate_data(n,e1,e2,b,group,exp):
+
+    # Mean and variance for features x1,x2,x3
+    # x3 is independent from x1 and x2
+    mu = np.array([1,-1,0])
+    var = np.array([[1,0.2,0],[0.2,1,0],[0,0,1]])
+    X = np.random.multivariate_normal(mu,var,n)
+
+    # Function from x3 to A
+    a = ((X[:,2] + b) >= 0).astype('float')
+
+    # Function from x1 and x2 to A
+    eps_1 = np.random.normal(0,e1,n)
+    eps_2 = np.random.normal(0,e2,n)
+
+    # add noise to a = 0 or a = 1
+    noise_a = eps_2*(a==group)
+    
+    if exp == 1:
+        y = (sigmoid(X[:,0] + X[:,1] + eps_1 + noise_a) >= 0.5).astype('float')
+    else:
+        y = (sigmoid(X[:,0] + X[:,1] + X[:,2] + eps_1 + noise_a) >= 0.5).astype('float')
+
+    # y_hat
+    if exp == 1:
+        y_prob = sigmoid(X[:,0] + x2)
+    else:
+        y_prob = sigmoid(x1 + x2 + x3)
+    
+    y_hat = (y_prob >= 0.5).astype('float')
+
+    return X, a, y_prob, y_hat, y
+
+# Functions to calculate the TPRs and FPRs with respect to A
+def old_calculate_bias_metrics(df):
+    a = df.a.values
+    y = np.array(df.y.values)
+    y_ = np.array(df.y_hat.values)
+    pb = BinaryBalancer(y=y,y_=y_,a=a)
+    alpha = pb.group_rates[1.0].tpr
+    beta = pb.group_rates[0.0].tpr
+    tau = pb.group_rates[1.0].fpr
+    phi = pb.group_rates[0.0].fpr
+    return alpha,beta,tau,phi
+
+
+# Generate a_hat for experiment 2
+def old_generate_a_hat(x3, b, mu ,noise):
+    e = np.random.normal(mu,noise)
+    a_hat = ((x3 + e + b) >= 0).astype('float')
+    return a_hat
+
+
+# Function to post process y_hat
+def old_eo_postprocess(df):
     a = df.a.values
     y = np.array(df.y.values)
     y_ = np.array(df.y_prob.values)
-    fair_model = BinaryBalancer(y=y,y_=y_,a=a,summary=False)
+    fair_model = BinaryBalancer(y=y,y_=y_,a=a)
     fair_model.adjust(goal='odds', summary=False)
     fair_yh = fair_model.predict(y_,a)
     return fair_yh, fair_model
@@ -231,7 +302,6 @@ def train(model, train_data, val_data, learning_rate, epochs):
                 total_tp_val += batch_tp.item()    
                 total_loss_val += batch_loss.item()
                     
-            
         print(
             f'Epochs: {epoch_num + 1} | Train Loss: {total_loss_train / (len(train_data)/batch_sz): .3f} \
             | Train Accuracy: {total_tp_train / len(train_data): .3f} \
